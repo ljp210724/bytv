@@ -237,6 +237,9 @@ run_nginx_container(){
 
   ensure_acme || return
 
+  # ✅ 关键修复：installcert 之前必须先创建证书目录
+  mkdir -p "$NGX_DIR" "$NGX_CERTS"
+
   echo "开始申请证书（standalone / Let's Encrypt）：$domain"
   "${HOME}/.acme.sh/acme.sh" --issue -d "$domain" --standalone --server letsencrypt \
     || { echo "证书签发失败（常见原因：80 不通 / 解析未生效 / 橙云代理 / 防火墙拦截）"; return; }
@@ -403,7 +406,7 @@ main(){
       2) 更新; pause ;;
       3) 状态; pause ;;
       4) 日志 ;;
-      5) 卸载 ;;   # 卸载会 exit，不需要 pause
+      5) 卸载 ;;
       6) 清理; pause ;;
       7) 绑定域名反代; pause ;;
       0) exit 0 ;;
