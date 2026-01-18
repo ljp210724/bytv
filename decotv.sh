@@ -163,7 +163,7 @@ ensure_acme(){
   fi
   [[ -x "${HOME}/.acme.sh/acme.sh" ]] || { echo "acme.sh 安装失败，请检查网络后重试"; return 1; }
 
-  # 强制使用 Let's Encrypt，避免 ZeroSSL/EAB 报错
+  # 强制 Let's Encrypt，避免 ZeroSSL/EAB
   "${HOME}/.acme.sh/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
   "${HOME}/.acme.sh/acme.sh" --upgrade --auto-upgrade >/dev/null 2>&1 || true
 }
@@ -211,6 +211,41 @@ run_nginx_container(){
   docker update --restart=always "$NGX_C" >/dev/null 2>&1 || true
 }
 
+# 证书目录（acme.sh ECC 默认目录）
+acme_cert_dir(){
+  local domain="$1"
+  echo "${HOME}/.acme.sh/${domain}_ecc"
+}
+
+has_local_cert(){
+  local domain="$1"
+  local cd; cd="$(acme_cert_dir "$domain")"
+  [[ -s "${cd}/fullchain.cer" && -s "${cd}/${domain}.key" ]]
+}
+
+issue_cert(){
+  local domain="$1" force="${2:-0}"
+  local acme="${HOME}/.acme.sh/acme.sh"
+
+  # standalone 需要 80；这里不强行失败返回，由外层判断（避免 Skipping 被当失败）
+  if [[ "$force" == "1" ]]; then
+    "$acme" --issue -d "$domain" --standalone --server letsencrypt --force
+  else
+    "$acme" --issue -d "$domain" --standalone --server letsencrypt
+  fi
+}
+
+install_cert(){
+  local domain="$1"
+  local acme="${HOME}/.acme.sh/acme.sh"
+
+  mkdir -p "$NGX_DIR" "$NGX_CERTS"
+
+  "$acme" --installcert -d "$domain" \
+    --key-file "$NGX_CERTS/key.pem" \
+    --fullchain-file "$NGX_CERTS/cert.pem" >/dev/null
+}
+
 绑定域名反代(){
   installed || { echo "未安装，请先部署"; return; }
 
@@ -230,24 +265,38 @@ run_nginx_container(){
   dip="$(domain_resolve_ip "$domain" || true)"
   if [[ -n "${sip:-}" && -n "${dip:-}" && "$sip" != "$dip" ]]; then
     echo "警告：域名解析 IP = ${dip}，本机公网 IP = ${sip}"
-    echo "如果开启了 Cloudflare 橙云代理，请先切灰云再签证书。"
+    echo "若开启 Cloudflare 橙云代理，请先切灰云再签证书。"
     read -r -p "仍继续？(y/n) [n]：" a
     [[ "${a:-n}" == "y" ]] || { echo "已取消"; return; }
   fi
 
   ensure_acme || return
 
-  # ✅ 关键修复：installcert 之前必须先创建证书目录
-  mkdir -p "$NGX_DIR" "$NGX_CERTS"
+  read -r -p "是否强制续期证书？(y/n) [n]：" f
+  local force="0"
+  [[ "${f:-n}" == "y" ]] && force="1"
 
-  echo "开始申请证书（standalone / Let's Encrypt）：$domain"
-  "${HOME}/.acme.sh/acme.sh" --issue -d "$domain" --standalone --server letsencrypt \
-    || { echo "证书签发失败（常见原因：80 不通 / 解析未生效 / 橙云代理 / 防火墙拦截）"; return; }
+  echo "开始申请/续期证书（standalone / Let's Encrypt）：$domain"
+  set +e
+  issue_cert "$domain" "$force"
+  rc=$?
+  set -e
 
-  "${HOME}/.acme.sh/acme.sh" --installcert -d "$domain" \
-    --key-file "$NGX_CERTS/key.pem" \
-    --fullchain-file "$NGX_CERTS/cert.pem" >/dev/null \
-    || { echo "证书安装失败"; return; }
+  # ✅ 关键修复：不要把 Skipping 当失败
+  # - 若 rc==0：正常签/续期成功，继续 install
+  # - 若 rc!=0：若本地已有证书（Skipping/已有有效证书等），继续 install
+  #            否则才算失败
+  if [[ $rc -ne 0 ]]; then
+    if has_local_cert "$domain"; then
+      echo "检测到本地已有有效证书（可能是 Skipping），继续安装证书..."
+    else
+      echo "证书签发失败（且本地无可用证书）。"
+      echo "常见原因：80 不通 / 解析未生效 / 橙云代理 / 防火墙拦截"
+      return
+    fi
+  fi
+
+  install_cert "$domain" || { echo "证书安装失败"; return; }
 
   local backend_port
   backend_port="$(kv APP_PORT)"
@@ -358,7 +407,6 @@ run_nginx_container(){
   rm -rf "$DIR" || true
 
   echo "卸载完成，即将删除脚本本体并退出。"
-
   ( sleep 1; rm -f "$0" >/dev/null 2>&1 || true ) &
   exit 0
 }
