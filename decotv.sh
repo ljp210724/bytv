@@ -8,7 +8,7 @@ DIR="/opt/decotv"; ENVF="$DIR/.env"; YML="$DIR/docker-compose.yml"
 C1="decotv-core"; C2="decotv-kvrocks"
 IMG1="ghcr.io/decohererk/decotv:latest"; IMG2="apache/kvrocks:latest"
 
-# 科技lion式：Docker Nginx + acme.sh standalone + 证书挂载 + nginx.conf 挂载
+# 域名反代：Docker Nginx + acme.sh standalone + 证书挂载 + nginx.conf 挂载
 NGX_DIR="$DIR/nginx"
 NGX_CONF="$NGX_DIR/nginx.conf"
 NGX_CERTS="$NGX_DIR/certs"
@@ -119,10 +119,7 @@ volumes: { kvrocks-data: {} }
 EOF
 }
 
-安装快捷指令(){
-  # 你之前如果要做 /usr/bin/decotv 的快捷面板，这里留空不影响
-  return 0
-}
+安装快捷指令(){ return 0; }
 
 部署完成输出(){
   local host p user pass
@@ -145,7 +142,7 @@ EOF
 }
 
 # ------------------------------
-# 科技lion式：域名反代 + HTTPS
+# 域名反代 + HTTPS
 # ------------------------------
 
 domain_resolve_ip(){
@@ -160,21 +157,22 @@ domain_resolve_ip(){
 }
 
 ensure_acme(){
-  # 科技lion教程里会装 socat，并用 acme.sh standalone 申请证书  [oai_citation:2‡科技lion官方博客〖国内版〗](https://blog.kejilion.pro/nginx01/)
   has socat || inst_pkgs socat || true
   if [[ ! -x "${HOME}/.acme.sh/acme.sh" ]]; then
     curl -fsSL https://get.acme.sh | sh >/dev/null 2>&1 || true
   fi
   [[ -x "${HOME}/.acme.sh/acme.sh" ]] || { echo "acme.sh 安装失败，请检查网络后重试"; return 1; }
+
+  # 强制使用 Let's Encrypt，避免 ZeroSSL/EAB 报错
+  "${HOME}/.acme.sh/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
+  "${HOME}/.acme.sh/acme.sh" --upgrade --auto-upgrade >/dev/null 2>&1 || true
 }
 
 write_nginx_conf(){
   local domain="$1" backend_port="$2"
   mkdir -p "$NGX_DIR" "$NGX_CERTS"
   cat >"$NGX_CONF" <<EOF
-events {
-  worker_connections 1024;
-}
+events { worker_connections 1024; }
 http {
   client_max_body_size 1000m;
 
@@ -216,17 +214,15 @@ run_nginx_container(){
 绑定域名反代(){
   installed || { echo "未安装，请先部署"; return; }
 
-  # 需要 80/443
   if inuse 80 || inuse 443; then
     echo "检测到 80/443 已被占用："
-    inuse 80 && echo " - 80 端口占用"
-    inuse 443 && echo " - 443 端口占用"
-    echo "科技lion式反代需要 80/443 可用（standalone 申请证书 + nginx 容器监听 80/443）。 [oai_citation:3‡科技lion官方博客〖国内版〗](https://blog.kejilion.pro/nginx01/)"
-    echo "请释放端口后再试。"
+    inuse 80 && echo " - 80 端口占用（standalone 需要 80）"
+    inuse 443 && echo " - 443 端口占用（nginx 需要 443）"
+    echo "请先释放 80/443 后再绑定域名。"
     return
   fi
 
-  read -r -p "请输入要绑定的域名（A记录指向本机）：" domain
+  read -r -p "请输入域名（A 记录指向本机公网 IP）：" domain
   [[ -n "${domain:-}" ]] || { echo "域名不能为空"; return; }
 
   local sip dip
@@ -234,21 +230,21 @@ run_nginx_container(){
   dip="$(domain_resolve_ip "$domain" || true)"
   if [[ -n "${sip:-}" && -n "${dip:-}" && "$sip" != "$dip" ]]; then
     echo "警告：域名解析 IP = ${dip}，本机公网 IP = ${sip}"
-    read -r -p "仍继续申请证书并配置反代？(y/n) [n]：" a
+    echo "如果开启了 Cloudflare 橙云代理，请先切灰云再签证书。"
+    read -r -p "仍继续？(y/n) [n]：" a
     [[ "${a:-n}" == "y" ]] || { echo "已取消"; return; }
   fi
 
-  read -r -p "证书注册邮箱（用于 Let's Encrypt 通知）：" mail
-  [[ -n "${mail:-}" ]] || { echo "邮箱不能为空"; return; }
-
   ensure_acme || return
 
-  echo "开始申请证书（standalone）：$domain"
-  "${HOME}/.acme.sh/acme.sh" --register-account -m "$mail" >/dev/null 2>&1 || true
-  "${HOME}/.acme.sh/acme.sh" --issue -d "$domain" --standalone || { echo "证书签发失败"; return; }
+  echo "开始申请证书（standalone / Let's Encrypt）：$domain"
+  "${HOME}/.acme.sh/acme.sh" --issue -d "$domain" --standalone --server letsencrypt \
+    || { echo "证书签发失败（常见原因：80 不通 / 解析未生效 / 橙云代理 / 防火墙拦截）"; return; }
+
   "${HOME}/.acme.sh/acme.sh" --installcert -d "$domain" \
     --key-file "$NGX_CERTS/key.pem" \
-    --fullchain-file "$NGX_CERTS/cert.pem" >/dev/null || { echo "证书安装失败"; return; }
+    --fullchain-file "$NGX_CERTS/cert.pem" >/dev/null \
+    || { echo "证书安装失败"; return; }
 
   local backend_port
   backend_port="$(kv APP_PORT)"
@@ -291,7 +287,7 @@ run_nginx_container(){
   compose up -d
   安装快捷指令
 
-  read -r -p "是否绑定域名并配置 HTTPS 反代（科技lion式，需占用80/443）？(y/n) [n]：" a
+  read -r -p "是否绑定域名并配置 HTTPS 反代（占用80/443）？(y/n) [n]：" a
   [[ "${a:-n}" == "y" ]] && 绑定域名反代 || true
 
   状态摘要
@@ -310,7 +306,7 @@ run_nginx_container(){
   echo "运行状态：$(运行状态)"
   echo "访问地址：$(访问地址)"
   if [[ "$(c_state "$NGX_C")" == "running" ]]; then
-    echo "域名反代：已启用（nginx容器运行中：$NGX_C）"
+    echo "域名反代：已启用（${NGX_C}）"
   else
     echo "域名反代：未启用/未运行"
   fi
